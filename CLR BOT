@@ -1210,3 +1210,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+import web  # just to keep web.py alive
