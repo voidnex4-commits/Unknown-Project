@@ -1222,4 +1222,10 @@ def main():
 if __name__ == "__main__":
     main()
 
-import web  # just to keep web.py alive
+# If you have a web.py (a tiny webserver to keep uptime pings happy), import it safely.
+try:
+    import web  # your web.py (optional)
+except Exception:
+    # web.py not present — that's fine
+    pass
+
