@@ -30,6 +30,17 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+def parse_color(hex_str: str) -> discord.Color:
+    """Convert '#RRGGBB' or 'RRGGBB' to discord.Color."""
+    if not hex_str:
+        return discord.Color.default()
+    s = hex_str.lstrip("#")
+    try:
+        return discord.Color(int(s, 16))
+    except Exception:
+        return discord.Color.default()
+
+
 # ============================
 # CONFIG / CONSTANTS
 # ============================
