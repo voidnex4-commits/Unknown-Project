@@ -1,29 +1,3 @@
-# bot.py
-# -----------------------------------------------------------------------------
-# Central London Roleplay — “Pure Gold” Discord Bot (discord.py 2.4+)
-# Single-file build containing:
-#   • Slash commands: /promote, /test, /welcometest, /update, /stafffeedback
-#   • Emergency override: /serveroverride → strips admin roles + locks chat
-#   • Unlock & restore: /unlockserver (alias /serverunlock)
-#   • Polls: /poll (2–10 options) with live updates + /closepoll (manual close)
-#   • Session commands (ALT-only, fixed channel): /sessionvote /ssu /ssd /sessionlow /sessionfull
-#   • Ticket system: /ticketpanel → Open/Close with transcripts (+ buttons)
-#   • Prefix commands:
-#         clr!codedelete    (two-step confirmation shutdown)
-#         clr!esd / clr!stu (pause/resume master-only)
-#   • Master phrase listener
-#   • Welcome message on member join
-#   • Cooldowns for test/welcometest
-#   • Command logging to a log channel
-#   • Uptime pinger + tiny HTTP server for Railway/Render keep-alive
-#
-# Env Vars required:
-#   DISCORD_TOKEN   – your bot token
-# Optional:
-#   PING_URL        – URL to ping every 5 minutes
-#   PORT            – HTTP server port (Railway/Render set this automatically)
-# -----------------------------------------------------------------------------
-
 from __future__ import annotations
 
 import os
