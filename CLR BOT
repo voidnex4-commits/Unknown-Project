@@ -1,676 +1,1201 @@
-# bot.py — Combined "Pure Gold" bot (discord.py 2.x)
-# Includes: slash commands + prefix commands, polls, session commands, server override/unlock,
-# promote, stafffeedback, welcome messages, master pause/resume, logging, uptime pinger,
-# and message command `clr!codedelete` (shuts the bot down).
+# bot.py
+# -----------------------------------------------------------------------------
+# Central London Roleplay — “Pure Gold” Discord Bot (discord.py 2.4+)
+# Single-file build containing:
+#   • Slash commands: /promote, /test, /welcometest, /update, /stafffeedback
+#   • Emergency override: /serveroverride → strips admin roles + locks chat
+#   • Unlock & restore: /unlockserver (alias /serverunlock)
+#   • Polls: /poll (2–10 options) with live updates + /closepoll (manual close)
+#   • Session commands (ALT-only, fixed channel): /sessionvote /ssu /ssd /sessionlow /sessionfull
+#   • Ticket system: /ticketpanel → Open/Close with transcripts (+ buttons)
+#   • Prefix commands:
+#         clr!codedelete    (two-step confirmation shutdown)
+#         clr!esd / clr!stu (pause/resume master-only)
+#   • Master phrase listener
+#   • Welcome message on member join
+#   • Cooldowns for test/welcometest
+#   • Command logging to a log channel
+#   • Uptime pinger + tiny HTTP server for Railway/Render keep-alive
 #
-# Requirements:
-#   pip install -U "discord.py[voice]" aiohttp
-#
-# Use environment variable DISCORD_TOKEN for token, or set TOKEN below.
+# Env Vars required:
+#   DISCORD_TOKEN   – your bot token
+# Optional:
+#   PING_URL        – URL to ping every 5 minutes
+#   PORT            – HTTP server port (Railway/Render set this automatically)
+# -----------------------------------------------------------------------------
 
-import asyncio
+from __future__ import annotations
+
 import os
+import io
+import re
 import sys
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+import json
+import math
+import time
+import textwrap
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple, Set
 
 import aiohttp
+from aiohttp import web
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("clr-bot")
+# ============================
+# CONFIG / CONSTANTS
+# ============================
 
-# ---------- CONFIG (IDs from your snippets) ----------
-TOKEN = os.environ.get("DISCORD_TOKEN")
-CLIENT_ID = 1404061937427284059
-GUILD_ID = 1377700771683893309
+# ——— IDs you asked to hard-lock ———
+MASTER_USER_ID = 1299998109543301172
 
+# ALT role and ALT-only channel
+ALT_ROLE_ID = 1377701315576201308
+SESSION_CHANNEL_ID = 1378021872188522646  # all session embeds must go here
+
+# Logging channel (update this to your real log channel)
+OVERRIDE_LOG_CHANNEL_ID = 1404196505816006797  # you can change if needed
+
+# Staff/permission roles & channels (from your original Node set)
 PROMOTION_PERMS_ROLE_ID = 1377701385759494264
-ALT_ROLE_ID = 1377701319053283379            # your ALT role constant (user provided)
-ALT_ROLE_LOCK = 1377701315576201308          # earlier you asked to lock sessions to this role (SLT?) - keep both
-STAFF_PROMOTION_EMOJI_ID = 1396581359635402994
+ALT_ROLE_ID_ALIAS = 1377701319053283379  # kept for parity if you need
 FEEDBACK_CHANNEL_ID = 1377729734011781130
 
+# Admin override role and list of admin roles to strip during emergency
 ADMIN_OVERRIDE_ROLE_ID = 1404202577100279960
 ADMIN_ROLE_IDS = [
-  1377701325592072283,1377701323092263045,1377701322480156702,1378352155236368455,
-  1377701326280069171,1403084480624984094,1403069817258377267,1377701320873738380,
-  1377701315576201308,1377701317757243472,1377701317308448888,1377701316322787399,
-  1403070430528667658,1391803171638218902,1399082073955766485,1377724116232310846,
-  1377701315328868382,1377701319053283379,1403070756996386816,1377701314188021760,
-  1377701313621524550,1377701307296518208,1378476527838038031,1404067925819658332
+    1377701325592072283, 1377701323092263045, 1377701322480156702, 1378352155236368455,
+    1377701326280069171, 1403084480624984094, 1403069817258377267, 1377701320873738380,
+    1377701315576201308, 1377701317757243472, 1377701317308448888, 1377701316322787399,
+    1403070430528667658, 1391803171638218902, 1399082073955766485, 1377724116232310846,
+    1377701315328868382, 1377701319053283379, 1403070756996386816, 1377701314188021760,
+    1377701313621524550, 1377701307296518208, 1378476527838038031, 1404067925819658332
 ]
 
+# Override broadcast channels
 OVERRIDE_CHANNEL_IDS = [
-  1377721062229545122, 1377724833881653288, 1377989178964316320, 1378005074193809591
+    1377721062229545122,  # announcements
+    1377724833881653288,  # chat
+    1377989178964316320,  # staff announcements
+    1378005074193809591,  # staff chat
 ]
-OVERRIDE_LOG_CHANNEL_ID = 1404196505816006797
-OVERRIDE_IMAGE_URL = "https://media.discordapp.net/attachments/1389640286485086349/1404205575952269386/New_York_Roleplay_Professional.png"
 
-POLL_GIF_URL = "https://media.discordapp.net/attachments/1377729047701753956/1399782056527138847/CLR_SMALLER_BANNER.gif"
-THUMBNAIL_URL = "https://media.discordapp.net/attachments/1389640286485086349/1404110742113751121/CLR_BG_LOGO.webp"
-
+# Shout/poll roles
 SLT_ROLE_ID = 1377701315576201308
 STAFF_SHOUT_ROLE_ID = 1378018500269838378
 
-# SESSION images and channel/role lock
-SESSION_CHANNEL_ID = 1378021872188522646  # session embeds must go only to this channel
-SESSION_IMAGES = {
-  "vote": "https://media.discordapp.net/attachments/1389640286485086349/1404449842801021019/SESSION_VOTE_1.png",
-  "start": "https://media.discordapp.net/attachments/1389640286485086349/1404450143247532032/SESSION_START.png",
-  "low": "https://media.discordapp.net/attachments/1389640286485086349/1404450813426008104/SESSION_START_1.png",
-  "full": "https://media.discordapp.net/attachments/1389640286485086349/1404451195262599322/SESSION_FULL.png",
-  "shutdown": "https://media.discordapp.net/attachments/1389640286485086349/1404451563896045618/SESSION_SHUTDOWN.png"
-}
-OWNERSHIP_EMOJI_ID = STAFF_PROMOTION_EMOJI_ID
+# Visuals / assets (from your message)
+THUMBNAIL_URL = "https://media.discordapp.net/attachments/1389640286485086349/1404110742113751121/CLR_BG_LOGO.webp?format=webp&width=454&height=454"
+POLL_GIF_URL = "https://media.discordapp.net/attachments/1377729047701753956/1399782056527138847/CLR_SMALLER_BANNER.gif?width=1152&height=180"
 
-# Master user + trigger phrase
-MASTER_USER_ID = 1299998109543301172
+SESSION_IMAGES = {
+    "vote": "https://media.discordapp.net/attachments/1389640286485086349/1404449842801021019/SESSION_VOTE_1.png?format=webp&quality=lossless&width=1152&height=405",
+    "start": "https://media.discordapp.net/attachments/1389640286485086349/1404450143247532032/SESSION_START.png?format=webp&quality=lossless&width=1152&height=405",
+    "low": "https://media.discordapp.net/attachments/1389640286485086349/1404450813426008104/SESSION_START_1.png?format=webp&quality=lossless&width=1152&height=405",
+    "full": "https://media.discordapp.net/attachments/1389640286485086349/1404451195262599322/SESSION_FULL.png?format=webp&quality=lossless&width=1152&height=405",
+    "shutdown": "https://media.discordapp.net/attachments/1389640286485086349/1404451563896045618/SESSION_SHUTDOWN.png?format=webp&quality=lossless&width=1152&height=405",
+}
+OVERRIDE_IMAGE_URL = "https://media.discordapp.net/attachments/1389640286485086349/1404205575952269386/New_York_Roleplay_Professional.png?format=webp&quality=lossless&width=823&height=411"
+
+# Misc
 TRIGGER_PHRASE = "pulled an all nighter js for the bot @CLR | Staff Utilities#5388 you better thank me"
 
-# Cooldowns
-COOLDOWN_TEST_SECONDS = 300  # 5 minutes
+# Cooldown
+TEST_COOLDOWN_SECONDS = 5 * 60  # 5 minutes
 
-# ---------- Bot setup ----------
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.messages = True
-intents.message_content = True
+# Token & web
+TOKEN = os.getenv("DISCORD_TOKEN")
+PORT = int(os.getenv("PORT", "3000"))
+PING_URL = os.getenv("PING_URL", "")
 
-# We'll support both prefix commands and slash commands
-BOT_PREFIX = "clr!"
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, application_id=CLIENT_ID)
+# ============================
+# DISCORD CLIENT
+# ============================
 
-# In-memory stores
-removed_roles_store: Dict[int, List[int]] = {}
-channel_perms_store: Dict[int, Dict[str, str]] = {}
-active_polls: Dict[str, dict] = {}
-is_paused = False
-cooldowns: Dict[int, float] = {}
+intents = discord.Intents(
+    guilds=True,
+    members=True,
+    messages=True,
+    message_content=True,
+    reactions=True,
+    presences=False,
+    emojis_and_stickers=True,
+    voice_states=False,
+    bans=False,
+    integrations=False,
+    webhooks=True,
+    invites=False,
+    dm_messages=False,
+    dm_reactions=False,
+    dm_typing=False,
+    typing=False,
+)
 
-# ---------- Helper: create session embeds ----------
-def make_session_embeds(hoster_avatar_url: str, hoster_username: str) -> Dict[str, discord.Embed]:
-    ownership = f"<:OWNERSHIP:{OWNERSHIP_EMOJI_ID}>"
-    vote = discord.Embed(title=f"{ownership} SESSION VOTE", description="Session Vote!\nVote for a session and let's get this underway!\n5 Votes are required!", color=0xFFD966)
-    vote.set_author(name=hoster_username, icon_url=hoster_avatar_url)
-    vote.set_image(url=SESSION_IMAGES["vote"])
-    vote.set_footer(text="Vote count required: 5")
+bot = commands.Bot(command_prefix="clr!", intents=intents)
+tree: app_commands.CommandTree = bot.tree
 
-    start = discord.Embed(title=f"{ownership} SESSION START UP!", description="A session has been started!\nPlease join up and show us some support!\nIf you have voted for the session,\nand have failed to join, you will be moderated!\nServer Code: `ukclr`", color=0x55FF55)
-    start.set_author(name=hoster_username, icon_url=hoster_avatar_url)
-    start.set_image(url=SESSION_IMAGES["start"])
+# ============================
+# GLOBAL STATE
+# ============================
 
-    low = discord.Embed(title=f"{ownership} SESSION LOW", description="Join up for some peak roleplays!\nIn-Game Code: `ukclr`", color=0xFFDD99)
-    low.set_author(name=hoster_username, icon_url=hoster_avatar_url)
-    low.set_image(url=SESSION_IMAGES["low"])
+is_paused: bool = False
+cooldowns: Dict[int, float] = {}  # user_id -> last_used_ts
+shutdown_confirm: Dict[int, float] = {}  # user_id -> ts for confirmation window
 
-    full = discord.Embed(title=f"{ownership} SESSION FULL", description="Thank you so much for the support, CLR!\nIf you cannot join, there should be a short queue!", color=0x99CCFF)
-    full.set_author(name=hoster_username, icon_url=hoster_avatar_url)
-    full.set_image(url=SESSION_IMAGES["full"])
+# Emergency override stores
+removed_roles_store: Dict[int, List[int]] = {}  # member_id -> [role_ids]
+channel_perms_store: Dict[int, Dict[str, str]] = {}  # channel_id -> prev states
 
-    shutdown = discord.Embed(title=f"{ownership} SESSION SHUT-DOWN", description="The session has shut!\nPlease leave with effect, or you will be moderated!\nThank you for joining Central London Roleplay.", color=0xFF6666)
-    shutdown.set_author(name=hoster_username, icon_url=hoster_avatar_url)
-    shutdown.set_image(url=SESSION_IMAGES["shutdown"])
+# Poll state
+@dataclass
+class PollData:
+    question: str
+    options: List[str]
+    issuer_id: int
+    channel_id: int
+    message_id: int
+    votes: List[int] = field(default_factory=list)
+    voters: Dict[int, int] = field(default_factory=dict)  # user_id -> option_index
+    ended: bool = False
+    end_ts: float = 0.0
+    title: Optional[str] = None
+    footer: Optional[str] = None
+    voter_role_id: Optional[int] = None
+    timeout_task: Optional[asyncio.Task] = None
 
-    return {"vote": vote, "start": start, "low": low, "full": full, "shutdown": shutdown}
+active_polls: Dict[str, PollData] = {}  # poll_id (message.id as str) -> PollData
 
-# ---------- Helper: log commands to override log channel ----------
-async def log_command(user: discord.User, command_name: str, channel_id: Optional[int], extra: str = "—"):
+# Ticket registry for transcripts
+open_tickets: Set[int] = set()  # channel_ids that are ticket channels
+
+# ============================
+# UTIL / HELPERS
+# ============================
+
+def now_ts() -> float:
+    return time.time()
+
+def fmt_seconds(secs: int) -> str:
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s"
+
+async def send_log(bot: commands.Bot, content: Optional[str] = None, embed: Optional[discord.Embed] = None):
     try:
         ch = bot.get_channel(OVERRIDE_LOG_CHANNEL_ID) or await bot.fetch_channel(OVERRIDE_LOG_CHANNEL_ID)
-        if ch and isinstance(ch, discord.TextChannel):
-            embed = discord.Embed(title="Command Executed", color=0x00AAFF, timestamp=datetime.utcnow())
-            embed.add_field(name="Command", value=str(command_name), inline=True)
-            embed.add_field(name="User", value=f"{user} ({user.id})", inline=True)
-            embed.add_field(name="Channel", value=f"<#{channel_id}>" if channel_id else "DM", inline=True)
-            embed.add_field(name="Extra", value=str(extra), inline=False)
-            await ch.send(embed=embed)
+        if ch and isinstance(ch, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+            if embed and content:
+                await ch.send(content=content, embed=embed)
+            elif embed:
+                await ch.send(embed=embed)
+            elif content:
+                await ch.send(content)
     except Exception as e:
-        log.exception("log_command failed: %s", e)
+        print(f"[LOG] failed: {e}")
 
-# ---------- Events ----------
+def user_can_manage(interaction: discord.Interaction, role_id: int) -> bool:
+    role = interaction.guild.get_role(role_id) if interaction.guild else None
+    return bool(role and isinstance(interaction.user, discord.Member) and role in interaction.user.roles)
+
+def require_alt_in_channel():
+    async def predicate(inter: discord.Interaction) -> bool:
+        # channel lock
+        if inter.channel_id != SESSION_CHANNEL_ID:
+            await inter.response.send_message("❌ This command is restricted to the session channel.", ephemeral=True)
+            return False
+        # role lock
+        role = inter.guild.get_role(ALT_ROLE_ID) if inter.guild else None
+        if not role or role not in inter.user.roles:
+            await inter.response.send_message("❌ ALT role required.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
+def green(text: str) -> discord.Embed:
+    return discord.Embed(description=text, color=discord.Color.green())
+
+def red(text: str) -> discord.Embed:
+    return discord.Embed(description=text, color=discord.Color.red())
+
+def blue(text: str) -> discord.Embed:
+    return discord.Embed(description=text, color=discord.Color.blurple())
+
+def make_session_embed(title: str, description: str, image_url: str, host: discord.Member) -> discord.Embed:
+    e = discord.Embed(title=title, description=description, color=discord.Color.gold())
+    e.set_image(url=image_url)
+    e.set_thumbnail(url=THUMBNAIL_URL)
+    e.set_author(name=host.display_name, icon_url=host.display_avatar.url)
+    return e
+
+async def gather_transcript(channel: discord.TextChannel) -> bytes:
+    """Collect up to last ~2k messages for a transcript (sufficient for tickets)."""
+    lines: List[str] = []
+    try:
+        async for msg in channel.history(limit=2000, oldest_first=True):
+            t = msg.created_at.replace(tzinfo=timezone.utc).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            author = f"{msg.author} ({msg.author.id})"
+            content = msg.content.replace("\n", "\\n")
+            lines.append(f"[{t}] {author}: {content}")
+            for a in msg.attachments:
+                lines.append(f"    [attachment] {a.url}")
+    except Exception as e:
+        lines.append(f"[error collecting transcript: {e}]")
+    buff = "\n".join(lines).encode("utf-8", errors="replace")
+    return buff
+
+# ============================
+# PERSISTENT VIEWS (Buttons)
+# ============================
+
+class PollButton(discord.ui.Button):
+    def __init__(self, poll_id: str, index: int, label_text: str):
+        custom_id = f"pollbtn:{poll_id}:{index}"
+        super().__init__(label=label_text, style=discord.ButtonStyle.primary, custom_id=custom_id)
+        self.poll_id = poll_id
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        poll = active_polls.get(self.poll_id)
+        if not poll or poll.ended:
+            await interaction.response.send_message("This poll has ended or does not exist.", ephemeral=True)
+            return
+
+        # voter role restriction if any
+        if poll.voter_role_id:
+            role = interaction.guild.get_role(poll.voter_role_id)
+            if role and role not in interaction.user.roles:
+                await interaction.response.send_message("You are not allowed to vote in this poll.", ephemeral=True)
+                return
+
+        uid = interaction.user.id
+        prev = poll.voters.get(uid)
+        if prev == self.index:
+            await interaction.response.send_message("You already voted for that option.", ephemeral=True)
+            return
+
+        # remove previous
+        if prev is not None and 0 <= prev < len(poll.votes):
+            poll.votes[prev] = max(0, poll.votes[prev] - 1)
+
+        # add new
+        poll.voters[uid] = self.index
+        poll.votes[self.index] += 1
+
+        # update message
+        try:
+            ch = interaction.channel
+            if not ch or ch.id != poll.channel_id:
+                ch = bot.get_channel(poll.channel_id) or await bot.fetch_channel(poll.channel_id)
+            msg = await ch.fetch_message(poll.message_id)
+            new_embed = build_poll_embed(poll, live=True)
+            await msg.edit(embed=new_embed)
+        except Exception as e:
+            print(f"[POLL] edit failed: {e}")
+
+        await interaction.response.send_message(f"You voted for option {self.index + 1}.", ephemeral=True)
+
+def build_poll_embed(p: PollData, live: bool = False) -> discord.Embed:
+    title = p.title or ("Poll" if live else "Poll (Closed)")
+    e = discord.Embed(title=title, color=discord.Color.blurple())
+    e.set_thumbnail(url=THUMBNAIL_URL)
+    # Description + tallies
+    desc_lines = [f"**{p.question}**", ""]
+    for i, opt in enumerate(p.options):
+        votes = p.votes[i]
+        desc_lines.append(f"{i+1}. {opt} — **{votes}** vote{'s' if votes!=1 else ''}")
+        if i < len(p.options) - 1:
+            desc_lines.append("")  # spacing
+    e.description = "\n".join(desc_lines)
+    e.set_image(url=POLL_GIF_URL)
+    footer = p.footer or ("Poll live" if live else "Poll ended")
+    if live and p.end_ts:
+        remain = max(0, int(p.end_ts - now_ts()))
+        footer = f"Poll closes in {fmt_seconds(remain)}"
+    e.set_footer(text=footer)
+    return e
+
+class PollView(discord.ui.View):
+    def __init__(self, poll_id: str, options: List[str]):
+        super().__init__(timeout=None)
+        # make up to 5 rows of 5 buttons (but we have 10 max → 2 rows)
+        for i, opt in enumerate(options):
+            label = opt if len(opt) <= 80 else (opt[:77] + "…")
+            self.add_item(PollButton(poll_id, i, f"{i+1}. {label}"))
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎫 Open Ticket", style=discord.ButtonStyle.green, custom_id="ticket:open")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if not guild:
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+        # Create private channel visible to author + staff/shout + admin override
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
+        }
+        # staff roles that should see tickets
+        for rid in {PROMOTION_PERMS_ROLE_ID, STAFF_SHOUT_ROLE_ID, SLT_ROLE_ID, ADMIN_OVERRIDE_ROLE_ID}:
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        name = f"ticket-{interaction.user.name}".replace(" ", "-")[:90]
+        channel = await guild.create_text_channel(name=name, overwrites=overwrites, reason=f"Ticket opened by {interaction.user} ({interaction.user.id})")
+        open_tickets.add(channel.id)
+
+        embed = discord.Embed(
+            title="🎟️ Ticket Opened",
+            description="Thanks for reaching out! A staff member will be with you shortly.\nUse the button below to close this ticket when finished.",
+            color=discord.Color.green()
+        )
+        embed.set_thumbnail(url=THUMBNAIL_URL)
+        v = TicketCloseView(channel_id=channel.id)
+        await channel.send(content=f"{interaction.user.mention}", embed=embed, view=v)
+        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.red, custom_id="ticket:close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Permission: author / staff / admin override can close
+        can_close = interaction.user.id == interaction.message.mentions[0].id if interaction.message.mentions else False
+        if not can_close:
+            # Allow staff/override
+            member: discord.Member = interaction.user  # type: ignore
+            roles = {r.id for r in getattr(member, "roles", [])}
+            if not roles.intersection({PROMOTION_PERMS_ROLE_ID, STAFF_SHOUT_ROLE_ID, SLT_ROLE_ID, ADMIN_OVERRIDE_ROLE_ID}):
+                return await interaction.response.send_message("❌ You can’t close this ticket.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        ch = bot.get_channel(self.channel_id) or await bot.fetch_channel(self.channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            return await interaction.followup.send("Channel missing.", ephemeral=True)
+
+        # Create transcript
+        buff = await gather_transcript(ch)
+        file = discord.File(io.BytesIO(buff), filename=f"transcript-{ch.name}-{int(now_ts())}.txt")
+
+        # Post transcript to log
+        embed = discord.Embed(title="Ticket Closed", description=f"Channel: {ch.mention}\nClosed by: {interaction.user.mention}", color=discord.Color.red())
+        await send_log(bot, embed=embed)
+        await send_log(bot, content="Transcript attached:", embed=None)
+        await send_log(bot, content=None, embed=None)  # spacer
+        try:
+            log_ch = bot.get_channel(OVERRIDE_LOG_CHANNEL_ID) or await bot.fetch_channel(OVERRIDE_LOG_CHANNEL_ID)
+            if isinstance(log_ch, discord.TextChannel):
+                await log_ch.send(file=file)
+        except Exception as e:
+            print(f"[TICKET] log send failed: {e}")
+
+        # Delete channel
+        try:
+            await ch.delete(reason=f"Ticket closed by {interaction.user}")
+        except Exception as e:
+            print(f"[TICKET] delete failed: {e}")
+
+# Register persistent views on startup
+PERSISTENT_VIEWS = [TicketPanelView()]
+
+# ============================
+# EVENTS
+# ============================
+
 @bot.event
 async def on_ready():
-    log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
-    # Sync commands to guild for quicker testing
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     try:
-        guild = discord.Object(id=GUILD_ID)
-        await bot.tree.sync(guild=guild)
-        log.info("Synced app commands to guild.")
-    except Exception:
-        try:
-            await bot.tree.sync()
-            log.info("Synced global app commands.")
-        except Exception as e:
-            log.exception("Failed to sync app commands: %s", e)
-    if not uptime_ping.is_running():
-        uptime_ping.start()
+        # re-add persistent views
+        for v in PERSISTENT_VIEWS:
+            bot.add_view(v)
+        await tree.sync()
+        print("🔧 Slash commands synced.")
+    except Exception as e:
+        print(f"[SYNC] failed: {e}")
+
+    uptime_pinger.start()
+    asyncio.create_task(run_http_server())
 
 @bot.event
 async def on_member_join(member: discord.Member):
     try:
-        welcome_embed = discord.Embed(color=0xADD8E6)
-        welcome_embed.set_thumbnail(url=THUMBNAIL_URL)
-        welcome_embed.title = "WELCOME!"
-        welcome_embed.description = f"WELCOME!\nWelcome {member.user.name} to {member.guild.name}! We hope you enjoy your stay here! Check our <#1377719482352402523> for more information!"
-        welcome_embed.set_image(url=POLL_GIF_URL)
-        welcome_embed.set_footer(text=f"Member Count: {member.guild.member_count}")
-        ch = member.guild.get_channel(1377724833881653288) or await member.guild.fetch_channel(1377724833881653288)
-        if ch:
-            await ch.send(embed=welcome_embed)
-    except Exception as e:
-        log.exception("error in on_member_join: %s", e)
+        guild = member.guild
+        member_count = guild.member_count
+        embed = discord.Embed(color=discord.Color.light_grey())
+        embed.set_thumbnail(url=THUMBNAIL_URL)
+        embed.description = textwrap.dedent(f"""
+            **WELCOME!**
+            Welcome {member.mention} to **{guild.name}**! We hope you enjoy your stay here!
+            Check our <#1377719482352402523> for more information!
 
-# ---------- MESSAGE HANDLER (master phrase + clr!esd/clr!stu + clr!codedelete) ----------
+            Member Count: **{member_count}**
+        """).strip()
+        ch = bot.get_channel(1377724833881653288) or await bot.fetch_channel(1377724833881653288)
+        if isinstance(ch, discord.TextChannel):
+            await ch.send(embed=embed)
+    except Exception as e:
+        print(f"[WELCOME] {e}")
+
 @bot.event
 async def on_message(message: discord.Message):
-    global is_paused
-    if message.author.bot:
+    # keep prefix commands functioning while paused logic is enforced below
+    if message.author.bot or not message.guild:
         return
 
     content = (message.content or "").strip()
+    lower = content.lower()
 
-    # clr!codedelete -> shut down (MASTER only)
-    if content == "clr!codedelete":
-        if message.author.id != MASTER_USER_ID:
-            await message.channel.send("You do not have permission to run clr!codedelete.")
-            return
-        await message.channel.send("Shutting down the bot as requested... goodbye.")
-        try:
-            # log to override channel
-            await log_command(message.author, "clr!codedelete", message.channel.id, "bot shutdown initiated")
-        except:
-            pass
-        # close bot gracefully
-        await bot.close()
-        # ensure process exit
-        try:
-            sys.exit(0)
-        except SystemExit:
-            os._exit(0)
-        return
-
-    # clr!esd (pause) / clr!stu (resume)
-    if content == "clr!esd":
-        if message.author.id != MASTER_USER_ID:
-            await message.channel.send("You do not have permission to pause the bot.")
-            return
-        if is_paused:
-            await message.channel.send("Bot is already paused.")
-            return
-        is_paused = True
-        await message.channel.send("Bot is now paused. Slash commands and polls are disabled for non-master users.")
-        await log_command(message.author, "clr!esd", message.channel.id, "bot paused")
-        return
-
-    if content == "clr!stu":
-        if message.author.id != MASTER_USER_ID:
-            await message.channel.send("You do not have permission to resume the bot.")
-            return
-        if not is_paused:
-            await message.channel.send("Bot is not paused.")
-            return
-        is_paused = False
-        await message.channel.send("Bot has resumed normal operation.")
-        await log_command(message.author, "clr!stu", message.channel.id, "bot resumed")
-        return
-
-    # Master trigger phrase (case-insensitive)
-    if TRIGGER_PHRASE.lower() in content.lower():
+    # Master phrase response
+    if TRIGGER_PHRASE.lower() in lower:
         if message.author.id == MASTER_USER_ID:
             await message.channel.send("thank you master")
         else:
             await message.channel.send(f"you are not my master, <@{MASTER_USER_ID}>")
         return
 
-    # Let commands process (prefix commands)
+    # Pause gating for normal content (prefix commands run below in cogs)
     await bot.process_commands(message)
 
-# ---------- PREFIX COMMANDS (for convenience; mirror slash functionality) ----------
-@bot.command(name="promote")
-@commands.has_role(PROMOTION_PERMS_ROLE_ID)
-async def cmd_promote(ctx: commands.Context, user: discord.Member, old_role: discord.Role, new_role: discord.Role, *, reason: str):
-    """Promote a staff member (prefix)."""
-    if is_paused and ctx.author.id != MASTER_USER_ID:
-        return await ctx.reply("Bot is paused.")
-    try:
-        if old_role not in user.roles:
-            return await ctx.reply(f"User does not have old role {old_role.mention}.")
-        # try remove/add
-        await user.remove_roles(old_role)
-        await user.add_roles(new_role)
-        embed = discord.Embed(color=0xADD8E6, description=f"STAFF PROMOTION\n\nStaff Member: {user.mention}\n\nOld Rank: {old_role.mention}\n\nNew Rank: {new_role.mention}\n\nReason: {reason}\n\nIssued by {ctx.author}")
-        embed.set_thumbnail(url=THUMBNAIL_URL)
-        await ctx.send(embed=embed)
-        await log_command(ctx.author, "promote (prefix)", ctx.channel.id, f"promoted {user} from {old_role.id} to {new_role.id}")
-    except Exception as e:
-        await ctx.send("Error performing promotion. Check bot permissions.")
-        await log_command(ctx.author, "promote (prefix) error", ctx.channel.id, str(e))
-        log.exception("promote prefix error: %s", e)
+# ============================
+# PREFIX COMMANDS
+# ============================
 
-@bot.command(name="test")
-async def cmd_test(ctx: commands.Context):
-    if is_paused and ctx.author.id != MASTER_USER_ID:
-        return await ctx.reply("Bot is paused.")
-    # cooldown per user
-    now = asyncio.get_event_loop().time()
-    last = cooldowns.get(ctx.author.id, 0)
-    if now - last < COOLDOWN_TEST_SECONDS:
-        return await ctx.reply(f"Please wait {int(COOLDOWN_TEST_SECONDS - (now - last))} seconds before using this command again.", ephemeral=True)
-    cooldowns[ctx.author.id] = now
-    try:
-        ch = ctx.guild.get_channel(1377724833881653288) or await ctx.guild.fetch_channel(1377724833881653288)
-        if not ch:
-            return await ctx.reply("Test channel not found.")
-        memberCount = ctx.guild.member_count
-        embed = discord.Embed(color=0xADD8E6, description=f"WELCOME!\nWelcome {ctx.author.name} to {ctx.guild.name}! We hope you enjoy your stay here! Check our <#1377719482352402523> for more information!")
-        embed.set_thumbnail(url=THUMBNAIL_URL)
-        embed.set_image(url=POLL_GIF_URL)
-        embed.set_footer(text=f"Member Count: {memberCount}")
-        await ch.send(embed=embed)
-        await ctx.reply("Test welcome message sent successfully!", ephemeral=True)
-        await log_command(ctx.author, "test", ctx.channel.id, f"sent to {ch.id}")
-    except Exception as e:
-        await ctx.reply("An error occurred while sending the test message.")
-        await log_command(ctx.author, "test (error)", ctx.channel.id, str(e))
-        log.exception("test cmd error: %s", e)
+@bot.command(name="esd")
+async def pause_cmd(ctx: commands.Context):
+    """Master-only: pause the bot (slash commands & poll votes blocked for others)."""
+    global is_paused
+    if ctx.author.id != MASTER_USER_ID:
+        return await ctx.reply("❌ Only master can pause me.")
+    if is_paused:
+        return await ctx.reply("Already paused.")
+    is_paused = True
+    await send_log(bot, content=f"Bot paused by {ctx.author} ({ctx.author.id}).")
+    await ctx.reply("⏸️ Bot paused. Slash commands and polls are disabled for non-master users.")
 
-@bot.command(name="welcometest")
-async def cmd_welcometest(ctx: commands.Context):
-    if is_paused and ctx.author.id != MASTER_USER_ID:
-        return await ctx.reply("Bot is paused.")
-    # cooldown handling same as test
-    now = asyncio.get_event_loop().time()
-    last = cooldowns.get(ctx.author.id, 0)
-    if now - last < COOLDOWN_TEST_SECONDS:
-        return await ctx.reply(f"Please wait {int(COOLDOWN_TEST_SECONDS - (now - last))} seconds before using this command again.")
-    cooldowns[ctx.author.id] = now
-    try:
-        ch = ctx.guild.get_channel(1377724833881653288) or await ctx.guild.fetch_channel(1377724833881653288)
-        if not ch:
-            return await ctx.reply("Welcome channel not found.")
-        memberCount = ctx.guild.member_count
-        embed = discord.Embed(color=0xADD8E6, description=f"WELCOME!\nWelcome {ctx.author.name} to {ctx.guild.name}! We hope you enjoy your stay here! Check our <#1377719482352402523> for more information!")
-        embed.set_thumbnail(url=THUMBNAIL_URL)
-        embed.set_image(url=POLL_GIF_URL)
-        embed.set_footer(text=f"Member Count: {memberCount}")
-        await ch.send(embed=embed)
-        await ctx.reply("Welcome test message sent successfully!", ephemeral=True)
-        await log_command(ctx.author, "welcometest", ctx.channel.id, f"sent to {ch.id}")
-    except Exception as e:
-        await ctx.reply("An error occurred while sending the welcome test message.")
-        await log_command(ctx.author, "welcometest (error)", ctx.channel.id, str(e))
-        log.exception("welcometest error: %s", e)
+@bot.command(name="stu")
+async def resume_cmd(ctx: commands.Context):
+    """Master-only: resume the bot."""
+    global is_paused
+    if ctx.author.id != MASTER_USER_ID:
+        return await ctx.reply("❌ Only master can resume me.")
+    if not is_paused:
+        return await ctx.reply("I am not paused.")
+    is_paused = False
+    await send_log(bot, content=f"Bot resumed by {ctx.author} ({ctx.author.id}).")
+    await ctx.reply("▶️ Bot resumed.")
 
-# ---------- Slash Commands (app commands) ----------
-# We register on the guild for instant availability
-@bot.tree.command(name="promote", description="Promote a staff member")
-@app_commands.describe(user="User to promote", old_role="Role to remove", new_role="Role to assign", reason="Reason for promotion")
-async def slash_promote(interaction: discord.Interaction, user: discord.Member, old_role: discord.Role, new_role: discord.Role, reason: str):
-    if is_paused and interaction.user.id != MASTER_USER_ID:
-        return await interaction.response.send_message("Bot is paused.", ephemeral=True)
-    if not interaction.user.get_role(PROMOTION_PERMS_ROLE_ID) and PROMOTION_PERMS_ROLE_ID not in [r.id for r in interaction.user.roles]:
-        await log_command(interaction.user, "promote (denied)", interaction.channel_id, "missing permission")
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-    await interaction.response.defer()
-    try:
-        member = user
-        if old_role.id not in [r.id for r in member.roles]:
-            await interaction.followup.send(f"The user does not have the old role <@&{old_role.id}>.")
-            return
-        await member.remove_roles(old_role)
-        await member.add_roles(new_role)
-        embed = discord.Embed(color=0xADD8E6, description=f"STAFF PROMOTION\n\nStaff Member: {member.mention}\n\nOld Rank: <@&{old_role.id}>\n\nNew Rank: <@&{new_role.id}>\n\nReason: {reason}\n\nIssued by {interaction.user}")
-        embed.set_thumbnail(url=THUMBNAIL_URL)
-        await interaction.followup.send(embed=embed)
-        await log_command(interaction.user, "promote", interaction.channel_id, f"promoted {member} from {old_role.id} to {new_role.id}")
-    except Exception as e:
-        await interaction.followup.send("An error occurred while processing the promotion.")
-        await log_command(interaction.user, "promote (error)", interaction.channel_id, str(e))
-        log.exception("slash promote error: %s", e)
+@bot.command(name="codedelete")
+async def codedelete(ctx: commands.Context):
+    """Two-step shutdown (Run twice within 30s)."""
+    global shutdown_confirm
+    if ctx.author.id != MASTER_USER_ID:
+        return await ctx.reply("❌ Only master can use this.")
+    now = now_ts()
+    ts = shutdown_confirm.get(ctx.author.id, 0)
+    if now - ts < 30:
+        await ctx.reply("⚠️ Confirmed. Bot shutting down…")
+        await send_log(bot, content=f"Shutdown requested by {ctx.author} ({ctx.author.id}).")
+        await bot.close()
+        return
+    shutdown_confirm[ctx.author.id] = now
+    await ctx.reply("⚠️ Run `clr!codedelete` again within **30s** to confirm shutdown.")
 
-@bot.tree.command(name="stafffeedback", description="Submit feedback for a staff member")
-@app_commands.describe(staff="Staff member to review", review="Your review", rating="Rating (e.g., 4 stars)")
-async def slash_stafffeedback(interaction: discord.Interaction, staff: discord.Member, review: str, rating: str):
-    if is_paused and interaction.user.id != MASTER_USER_ID:
-        return await interaction.response.send_message("Bot is paused.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    try:
-        ch = bot.get_channel(FEEDBACK_CHANNEL_ID) or await bot.fetch_channel(FEEDBACK_CHANNEL_ID)
-        if not ch:
-            return await interaction.followup.send("Feedback channel not found.", ephemeral=True)
-        embed = discord.Embed(color=0xADD8E6, title="Staff Feedback")
-        embed.set_thumbnail(url=THUMBNAIL_URL)
-        embed.add_field(name="Staff Member", value=f"<@{staff.id}>", inline=True)
-        embed.add_field(name="Rating", value=rating, inline=True)
-        embed.add_field(name="Review", value=review, inline=False)
-        embed.set_footer(text=f"Feedback submitted by {interaction.user}")
-        await ch.send(embed=embed)
-        await interaction.followup.send("Thank you for your feedback!", ephemeral=True)
-        await log_command(interaction.user, "stafffeedback", interaction.channel_id, f"for {staff.id} rating:{rating}")
-    except Exception as e:
-        await interaction.followup.send("An error occurred while submitting your feedback.", ephemeral=True)
-        await log_command(interaction.user, "stafffeedback (error)", interaction.channel_id, str(e))
-        log.exception("stafffeedback error: %s", e)
+# ============================
+# SLASH: BASIC COMMANDS (PROMOTE/TEST/WELCOME/UPDATE/STAFFFEEDBACK)
+# ============================
 
-# ---------- SERVER OVERRIDE & UNLOCK (slash) ----------
-@bot.tree.command(name="serveroverride", description="Emergency override — remove admin roles and lockdown channels")
-@app_commands.describe(reason="Reason (optional)")
-async def slash_serveroverride(interaction: discord.Interaction, reason: Optional[str] = None):
-    global removed_roles_store, channel_perms_store
-    if is_paused and interaction.user.id != MASTER_USER_ID:
-        return await interaction.response.send_message("Bot is paused.", ephemeral=True)
-    if not isinstance(interaction.user, discord.Member) or ADMIN_OVERRIDE_ROLE_ID not in [r.id for r in interaction.user.roles]:
-        await log_command(interaction.user, "serveroverride (denied)", interaction.channel_id, "missing admin override role")
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-    await interaction.response.defer()
-    reason = reason or "No reason provided"
-    guild = interaction.guild
-    removed_roles_store = {}
-    # 1) remove admin roles from members who do NOT have Admin Override
+@tree.command(name="promote", description="Promote a staff member")
+@app_commands.describe(
+    user="User to promote",
+    old_role="Role to remove",
+    new_role="Role to add",
+    reason="Reason for promotion",
+)
+async def promote(inter: discord.Interaction, user: discord.Member, old_role: discord.Role, new_role: discord.Role, reason: str):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+
+    # permission check
+    if not isinstance(inter.user, discord.Member) or (inter.guild and inter.guild.get_role(PROMOTION_PERMS_ROLE_ID) not in inter.user.roles):
+        await send_log(bot, content=f"/promote denied for {inter.user} in <#{inter.channel_id}>")
+        return await inter.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=False, thinking=True)
+    try:
+        if old_role in user.roles:
+            await user.remove_roles(old_role, reason=f"Promotion by {inter.user} | {reason}")
+        await user.add_roles(new_role, reason=f"Promotion by {inter.user} | {reason}")
+    except discord.Forbidden:
+        await send_log(bot, content="Role management permissions issue in /promote")
+        return await inter.followup.send("❌ I lack permission to manage these roles.")
+
+    embed = discord.Embed(color=discord.Color.blue())
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.description = textwrap.dedent(f"""
+        **STAFF PROMOTION**
+
+        Staff Member: {user.mention}
+
+        Old Rank: {old_role.mention}
+        New Rank: {new_role.mention}
+
+        Reason: {reason}
+
+        Issued by {inter.user.mention}
+    """).strip()
+    await inter.followup.send(embed=embed)
+    await send_log(bot, content=f"/promote by {inter.user} → {user} {old_role.id} → {new_role.id}")
+
+@tree.command(name="test", description="Send a test message to the test channel")
+async def testcmd(inter: discord.Interaction):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+
+    uid = inter.user.id
+    last = cooldowns.get(uid, 0)
+    if now_ts() - last < TEST_COOLDOWN_SECONDS:
+        remain = int(TEST_COOLDOWN_SECONDS - (now_ts() - last))
+        return await inter.response.send_message(f"⌛ Please wait **{fmt_seconds(remain)}** before using this again.", ephemeral=True)
+    cooldowns[uid] = now_ts()
+
+    ch = bot.get_channel(1377724833881653288) or await bot.fetch_channel(1377724833881653288)
+    if not isinstance(ch, discord.TextChannel):
+        await send_log(bot, content="/test failed — channel not found")
+        return await inter.response.send_message("❌ Test channel not found.", ephemeral=True)
+
+    guild = inter.guild
+    member_count = guild.member_count if guild else 0
+    embed = discord.Embed(color=discord.Color.light_grey())
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.description = textwrap.dedent(f"""
+        **WELCOME!**
+        Welcome {inter.user.mention} to **{guild.name if guild else 'the server'}**!
+        Check our <#1377719482352402523> for more information!
+
+        Member Count: **{member_count}**
+    """).strip()
+
+    await ch.send(embed=embed)
+    await inter.response.send_message("✅ Test welcome message sent.", ephemeral=True)
+    await send_log(bot, content=f"/test by {inter.user} in <#{inter.channel_id}>")
+
+@tree.command(name="welcometest", description="Send a test welcome to the welcome channel")
+async def welcometest(inter: discord.Interaction):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+
+    uid = inter.user.id
+    last = cooldowns.get(uid, 0)
+    if now_ts() - last < TEST_COOLDOWN_SECONDS:
+        remain = int(TEST_COOLDOWN_SECONDS - (now_ts() - last))
+        return await inter.response.send_message(f"⌛ Please wait **{fmt_seconds(remain)}** before using this again.", ephemeral=True)
+    cooldowns[uid] = now_ts()
+
+    ch = bot.get_channel(1377724833881653288) or await bot.fetch_channel(1377724833881653288)
+    if not isinstance(ch, discord.TextChannel):
+        await send_log(bot, content="/welcometest failed — channel not found")
+        return await inter.response.send_message("❌ Welcome channel not found.", ephemeral=True)
+
+    guild = inter.guild
+    member_count = guild.member_count if guild else 0
+    embed = discord.Embed(color=discord.Color.light_grey())
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.description = textwrap.dedent(f"""
+        **WELCOME!**
+        Welcome {inter.user.mention} to **{guild.name if guild else 'the server'}**!
+        Check our <#1377719482352402523> for more information!
+
+        Member Count: **{member_count}**
+    """).strip()
+
+    await ch.send(embed=embed)
+    await inter.response.send_message("✅ Welcome test message sent.", ephemeral=True)
+    await send_log(bot, content=f"/welcometest by {inter.user} in <#{inter.channel_id}>")
+
+@tree.command(name="update", description="Send a server update announcement")
+@app_commands.describe(
+    update_number="Update number (string/label)",
+    update_description="Description of the update",
+    image1="First image URL (optional)",
+    image2="Second image URL (optional)",
+    image3="Third image URL (optional)",
+)
+async def update(inter: discord.Interaction, update_number: str, update_description: str, image1: Optional[str] = None, image2: Optional[str] = None, image3: Optional[str] = None):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+
+    if not isinstance(inter.user, discord.Member) or (inter.guild and inter.guild.get_role(PROMOTION_PERMS_ROLE_ID) not in inter.user.roles):
+        await send_log(bot, content=f"/update denied for {inter.user}")
+        return await inter.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=False, thinking=True)
+    ch = bot.get_channel(1377728485811347968) or await bot.fetch_channel(1377728485811347968)
+    if not isinstance(ch, discord.TextChannel):
+        await send_log(bot, content="/update failed — announcements channel not found")
+        return await inter.followup.send("❌ Announcement channel not found.")
+
+    embed = discord.Embed(title=f"Update #{update_number}", description=update_description, color=discord.Color.blue())
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    if image1:
+        embed.set_image(url=image1)
+    # extra images as links
+    if image2:
+        embed.add_field(name="Additional Image", value=f"[Image 2]({image2})", inline=False)
+    if image3:
+        embed.add_field(name="Additional Image", value=f"[Image 3]({image3})", inline=False)
+
+    await ch.send(embed=embed)
+    await inter.followup.send("✅ Update announcement sent.")
+    await send_log(bot, content=f"/update by {inter.user} — #{update_number}")
+
+@tree.command(name="stafffeedback", description="Submit feedback for a staff member")
+@app_commands.describe(
+    staff="Staff user",
+    review="Your review",
+    rating="Rating (e.g., 4 stars)"
+)
+async def stafffeedback(inter: discord.Interaction, staff: discord.Member, review: str, rating: str):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=True, thinking=True)
+    ch = bot.get_channel(FEEDBACK_CHANNEL_ID) or await bot.fetch_channel(FEEDBACK_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        await send_log(bot, content="/stafffeedback failed — feedback channel not found")
+        return await inter.followup.send("❌ Feedback channel not found.", ephemeral=True)
+
+    embed = discord.Embed(title="Staff Feedback", color=discord.Color.blue())
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.add_field(name="Staff Member", value=staff.mention, inline=True)
+    embed.add_field(name="Rating", value=rating, inline=True)
+    embed.add_field(name="Review", value=review, inline=False)
+    embed.set_footer(text=f"Submitted by {inter.user}")
+    await ch.send(embed=embed)
+    await inter.followup.send("✅ Thank you for your feedback!", ephemeral=True)
+    await send_log(bot, content=f"/stafffeedback by {inter.user} → {staff} rating:{rating}")
+
+# ============================
+# EMERGENCY OVERRIDE / UNLOCK
+# ============================
+
+@tree.command(name="serveroverride", description="Emergency override — strip admin roles & lock channels")
+@app_commands.describe(reason="Optional reason")
+async def serveroverride(inter: discord.Interaction, reason: Optional[str] = "No reason provided"):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+
+    # permission: must have Admin Override role
+    if not isinstance(inter.user, discord.Member) or (inter.guild and inter.guild.get_role(ADMIN_OVERRIDE_ROLE_ID) not in inter.user.roles):
+        await send_log(bot, content=f"/serveroverride denied for {inter.user}")
+        return await inter.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=False, thinking=True)
+    guild = inter.guild
+    removed_roles_store.clear()
+    channel_perms_store.clear()
+
     removed_count = 0
-    members = await guild.fetch_members().flatten()
-    for member in members:
-        # skip if member has admin override
-        if ADMIN_OVERRIDE_ROLE_ID in [r.id for r in member.roles]:
-            continue
-        removed = []
-        for roleid in ADMIN_ROLE_IDS:
-            if roleid in [r.id for r in member.roles]:
-                try:
-                    await member.remove_roles(discord.Object(id=roleid))
-                    removed.append(roleid)
-                    removed_count += 1
-                except Exception as e:
-                    log.exception("Failed remove role: %s", e)
-        if removed:
-            removed_roles_store[member.id] = removed
 
-    # 2) store previous channel perms where @everyone had SendMessages allowed
-    channel_perms_store = {}
-    for ch in guild.channels:
-        try:
-            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+    # 1) Remove admin roles from members who DO NOT have Admin Override
+    try:
+        async for member in guild.fetch_members(limit=None):
+            if guild.get_role(ADMIN_OVERRIDE_ROLE_ID) in member.roles:
                 continue
-            everyone_perms = ch.permissions_for(guild.default_role)
-            if everyone_perms.send_messages:
-                # capture existing overwrite states
-                prevEveryoneState = "unset"
-                prevAdminState = "unset"
-                overwrite = ch.overwrites_for(guild.default_role)
-                if overwrite.send_messages is True:
-                    prevEveryoneState = "allow"
-                elif overwrite.send_messages is False:
-                    prevEveryoneState = "deny"
-                admin_overwrite = ch.overwrites_for(discord.Object(id=ADMIN_OVERRIDE_ROLE_ID))
-                if getattr(admin_overwrite, "send_messages", None) is True:
-                    prevAdminState = "allow"
-                elif getattr(admin_overwrite, "send_messages", None) is False:
-                    prevAdminState = "deny"
-                channel_perms_store[ch.id] = {"prevEveryoneState": prevEveryoneState, "prevAdminState": prevAdminState}
-        except Exception:
-            continue
+            removed_for_member: List[int] = []
+            for rid in ADMIN_ROLE_IDS:
+                role = guild.get_role(rid)
+                if role and role in member.roles:
+                    try:
+                        await member.remove_roles(role, reason=f"Emergency override by {inter.user} ({inter.user.id})")
+                        removed_for_member.append(rid)
+                        removed_count += 1
+                    except Exception as e:
+                        print(f"[OVERRIDE] remove role failed: {e}")
+            if removed_for_member:
+                removed_roles_store[member.id] = removed_for_member
+    except Exception as e:
+        print(f"[OVERRIDE] member iteration failed: {e}")
 
-    # 3) send image + message to target override channels
-    override_embed = discord.Embed(title="ADMIN OVERRIDE TRIGGERED", color=0xFFCC00, description="All chattable channels will now be placed on lockdown.\n\nPlease be patient while we make things better.")
+    # 2) Detect channels where @everyone can send → we will lock them
+    for ch in guild.channels:
+        if not isinstance(ch, (discord.TextChannel, discord.ForumChannel, discord.Thread)):
+            continue
+        try:
+            # Save prior states for @everyone & Admin Override role
+            everyone = guild.default_role
+            prev_everyone = "unset"
+            ow_everyone = ch.overwrites_for(everyone)
+            if ow_everyone.send_messages is True:
+                prev_everyone = "allow"
+            elif ow_everyone.send_messages is False:
+                prev_everyone = "deny"
+
+            prev_admin = "unset"
+            admin_role = guild.get_role(ADMIN_OVERRIDE_ROLE_ID)
+            if admin_role:
+                ow_admin = ch.overwrites_for(admin_role)
+                if ow_admin.send_messages is True:
+                    prev_admin = "allow"
+                elif ow_admin.send_messages is False:
+                    prev_admin = "deny"
+
+            channel_perms_store[ch.id] = {"prevEveryoneState": prev_everyone, "prevAdminState": prev_admin}
+        except Exception as e:
+            print(f"[OVERRIDE] read perms failed: {e}")
+
+    # 3) Send override embed & image to target channels
+    override_embed = discord.Embed(
+        title="ADMIN OVERRIDE TRIGGERED",
+        description="All chattable channels will now be placed on lockdown.\n\nPlease be patient while we make things better.",
+        color=discord.Color.orange(),
+    )
     override_embed.set_thumbnail(url=THUMBNAIL_URL)
-    override_embed.add_field(name="Activated by", value=f"{interaction.user} ({interaction.user.id})", inline=False)
+    override_embed.add_field(name="Activated by", value=f"{inter.user} ({inter.user.id})", inline=False)
     override_embed.add_field(name="Reason", value=reason or "No reason provided", inline=False)
     override_embed.add_field(name="Admin roles removed (approx)", value=str(removed_count), inline=True)
-    override_embed.set_image(url=OVERRIDE_IMAGE_URL)
-    override_embed.timestamp = datetime.utcnow()
+
     for ch_id in OVERRIDE_CHANNEL_IDS:
         try:
             ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
-            if ch and isinstance(ch, discord.TextChannel):
+            if isinstance(ch, discord.TextChannel):
                 await ch.send(embed=override_embed)
-        except Exception:
-            continue
-
-    # 4) Lock recorded channels: set @everyone send_messages false, allow Admin Override send_messages true
-    for cid, prev in channel_perms_store.items():
-        try:
-            ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
-            if not ch or not isinstance(ch, discord.TextChannel):
-                continue
-            await ch.set_permissions(guild.default_role, send_messages=False)
-            await ch.set_permissions(discord.Object(id=ADMIN_OVERRIDE_ROLE_ID), send_messages=True)
+                await ch.send(OVERRIDE_IMAGE_URL)
         except Exception as e:
-            log.exception("Failed to edit perms for channel %s: %s", cid, e)
+            print(f"[OVERRIDE] broadcast failed: {e}")
 
-    # 5) Log to log channel & respond
-    try:
-        logch = bot.get_channel(OVERRIDE_LOG_CHANNEL_ID) or await bot.fetch_channel(OVERRIDE_LOG_CHANNEL_ID)
-        if logch:
-            log_embed = discord.Embed(title="Server Override Activated", color=0xFF5500)
-            log_embed.set_thumbnail(url=THUMBNAIL_URL)
-            log_embed.add_field(name="Triggered by", value=f"{interaction.user} ({interaction.user.id})", inline=False)
-            log_embed.add_field(name="Reason", value=reason or "No reason provided", inline=False)
-            log_embed.add_field(name="Admin roles removed (approx)", value=str(removed_count), inline=True)
-            log_embed.add_field(name="Locked channels", value=str(len(channel_perms_store)), inline=True)
-            log_embed.timestamp = datetime.utcnow()
-            await logch.send(embed=log_embed)
-    except Exception:
-        pass
-
-    await interaction.followup.send("Emergency override activated. Admin roles removed and channels locked.")
-    await log_command(interaction.user, "serveroverride", interaction.channel.id, f"removed roles:{removed_count} locked:{len(channel_perms_store)}")
-
-@bot.tree.command(name="unlockserver", description="Unlock server channels and restore roles after serveroverride")
-async def slash_unlockserver(interaction: discord.Interaction):
-    global removed_roles_store, channel_perms_store
-    if not isinstance(interaction.user, discord.Member) or ADMIN_OVERRIDE_ROLE_ID not in [r.id for r in interaction.user.roles]:
-        await log_command(interaction.user, "unlockserver (denied)", interaction.channel_id, "missing ADMIN_OVERRIDE_ROLE_ID")
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-    await interaction.response.defer()
-    guild = interaction.guild
-    # Restore channel perms from channel_perms_store
-    for cid, prev in channel_perms_store.items():
+    # 4) Lock channels: @everyone cannot send, Admin Override can send
+    for ch_id, prev in channel_perms_store.items():
         try:
-            ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
-            if not ch or not isinstance(ch, discord.TextChannel):
+            ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+            if not isinstance(ch, discord.TextChannel):
                 continue
-            if prev["prevEveryoneState"] == "allow":
-                await ch.set_permissions(guild.default_role, send_messages=True)
-            elif prev["prevEveryoneState"] == "deny":
-                await ch.set_permissions(guild.default_role, send_messages=False)
-            else:
-                # remove overwrite
-                await ch.set_permissions(guild.default_role, overwrite=None)
-            if prev["prevAdminState"] == "allow":
-                await ch.set_permissions(discord.Object(id=ADMIN_OVERRIDE_ROLE_ID), send_messages=True)
-            elif prev["prevAdminState"] == "deny":
-                await ch.set_permissions(discord.Object(id=ADMIN_OVERRIDE_ROLE_ID), send_messages=False)
-            else:
-                await ch.set_permissions(discord.Object(id=ADMIN_OVERRIDE_ROLE_ID), overwrite=None)
+            everyone = guild.default_role
+            admin_role = guild.get_role(ADMIN_OVERRIDE_ROLE_ID)
+
+            ow = ch.overwrites
+            ow_everyone = ch.overwrites_for(everyone)
+            ow_everyone.send_messages = False
+            await ch.set_permissions(everyone, overwrite=ow_everyone)
+
+            if admin_role:
+                ow_admin = ch.overwrites_for(admin_role)
+                ow_admin.send_messages = True
+                await ch.set_permissions(admin_role, overwrite=ow_admin)
         except Exception as e:
-            log.exception("unlockserver channel restore error: %s", e)
-    # Restore roles removed
+            print(f"[OVERRIDE] lock perms failed: {e}")
+
+    # 5) Log
+    log = discord.Embed(title="Server Override Activated", color=discord.Color.red())
+    log.set_thumbnail(url=THUMBNAIL_URL)
+    log.add_field(name="Triggered by", value=f"{inter.user} ({inter.user.id})", inline=False)
+    log.add_field(name="Reason", value=reason or "No reason provided", inline=False)
+    log.add_field(name="Admin roles removed (approx)", value=str(removed_count), inline=True)
+    log.add_field(name="Locked channels", value=str(len(channel_perms_store)), inline=True)
+    await send_log(bot, embed=log)
+
+    await inter.followup.send("✅ Emergency override activated. Admin roles removed and channels locked.")
+
+async def unlock_server(guild: discord.Guild, actor_tag: str = "unknown"):
+    # restore channel perms
+    for ch_id, prev in channel_perms_store.items():
+        try:
+            ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            everyone = guild.default_role
+            admin_role = guild.get_role(ADMIN_OVERRIDE_ROLE_ID)
+
+            # @everyone restore
+            pe = prev.get("prevEveryoneState", "unset")
+            ow_everyone = ch.overwrites_for(everyone)
+            if pe == "allow":
+                ow_everyone.send_messages = True
+            elif pe == "deny":
+                ow_everyone.send_messages = False
+            else:
+                ow_everyone.send_messages = None
+            await ch.set_permissions(everyone, overwrite=ow_everyone)
+
+            # Admin override restore
+            pa = prev.get("prevAdminState", "unset")
+            if admin_role:
+                ow_admin = ch.overwrites_for(admin_role)
+                if pa == "allow":
+                    ow_admin.send_messages = True
+                elif pa == "deny":
+                    ow_admin.send_messages = False
+                else:
+                    ow_admin.send_messages = None
+                await ch.set_permissions(admin_role, overwrite=ow_admin)
+        except Exception as e:
+            print(f"[UNLOCK] restore perms failed: {e}")
+
+    # restore stripped roles
     restored = 0
     for member_id, roles in removed_roles_store.items():
         try:
-            member = guild.get_member(member_id) or await guild.fetch_member(member_id)
+            member = await guild.fetch_member(member_id)
             for rid in roles:
-                try:
-                    await member.add_roles(discord.Object(id=rid))
+                role = guild.get_role(rid)
+                if role and role not in member.roles:
+                    await member.add_roles(role, reason="unlockserver restore")
                     restored += 1
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    # Clear stores
-    channel_perms_store = {}
-    removed_roles_store = {}
-    await interaction.followup.send("Server unlocked and previous permissions restored (where available).")
-    await log_command(interaction.user, "unlockserver", interaction.channel.id, f"restored ~{restored} roles")
+        except Exception as e:
+            print(f"[UNLOCK] restore roles failed: {e}")
 
-# ---------- POLLS (basic implementation) ----------
-# For simplicity: /poll question duration options as a single string separated by '|' (OR send via prefix)
-@bot.tree.command(name="poll", description="Create a poll (options separated by |)")
-@app_commands.describe(question="Question", duration="Duration in hours", options="Options, separated by | (2-10)")
-async def slash_poll(interaction: discord.Interaction, question: str, duration: int, options: str, title: Optional[str] = None, footer: Optional[str] = None):
-    if is_paused and interaction.user.id != MASTER_USER_ID:
-        return await interaction.response.send_message("Bot is paused.", ephemeral=True)
-    # permission check
-    member_roles = [r.id for r in interaction.user.roles] if isinstance(interaction.user, discord.Member) else []
-    if SLT_ROLE_ID not in member_roles and STAFF_SHOUT_ROLE_ID not in member_roles:
-        await log_command(interaction.user, "poll (denied)", interaction.channel_id, "missing SLT/StaffShout")
-        return await interaction.response.send_message("You do not have permission to create polls.", ephemeral=True)
+    # clear
+    channel_perms_store.clear()
+    removed_roles_store.clear()
 
-    opts = [o.strip() for o in options.split("|") if o.strip()]
-    if len(opts) < 2:
-        return await interaction.response.send_message("You must provide at least 2 options (separated by |).", ephemeral=True)
-    if len(opts) > 10:
-        return await interaction.response.send_message("Maximum 10 options allowed.", ephemeral=True)
-
-    await interaction.response.defer()
-    # make embed
-    initialDesc = "\n\n".join(f"{i+1}. {opt} — 0 votes" for i, opt in enumerate(opts))
-    embed = discord.Embed(title=title or "Poll", description=f"**{question}**\n\n{initialDesc}", color=0xADD8E6)
+    # log
+    embed = discord.Embed(title="Server Override Lifted", color=discord.Color.green())
     embed.set_thumbnail(url=THUMBNAIL_URL)
-    embed.set_image(url=POLL_GIF_URL)
-    embed.set_footer(text=footer or f"Poll closes in {duration} hour(s)")
-    # build buttons
-    view = discord.ui.View(timeout=None)
-    for i, opt in enumerate(opts):
-        async def make_callback(index):
-            async def callback(inter: discord.Interaction):
-                # voting
-                pid = poll_id
-                p = active_polls.get(pid)
-                if not p or p.get("ended"):
-                    return await inter.response.send_message("This poll has ended or does not exist.", ephemeral=True)
-                # optional voter role check omitted for simplicity
-                uid = inter.user.id
-                prev = p["voters"].get(uid)
-                if prev is not None and prev == index:
-                    return await inter.response.send_message("You have already voted for that option.", ephemeral=True)
-                if prev is not None:
-                    p["votes"][prev] = max(0, (p["votes"][prev] or 1) - 1)
-                p["votes"][index] = (p["votes"][index] or 0) + 1
-                p["voters"][uid] = index
-                # update message
-                liveDesc = "\n\n".join(f"{ii+1}. {o} — {p['votes'][ii] or 0} votes" for ii, o in enumerate(p["options"]))
-                new_embed = discord.Embed(title=p["title"] or "Poll", description=f"**{p['question']}**\n\n{liveDesc}", color=0xADD8E6)
-                new_embed.set_thumbnail(url=THUMBNAIL_URL)
-                new_embed.set_image(url=POLL_GIF_URL)
-                new_embed.set_footer(text=p["footer"] or f"Poll closes in {duration} hour(s)")
-                try:
-                    await p["message"].edit(embed=new_embed)
-                except Exception:
-                    pass
-                await inter.response.send_message(f"You voted for option {index+1}.", ephemeral=True)
-            return callback
-        btn = discord.ui.Button(label=f"{i+1}. {opt[:75]}", style=discord.ButtonStyle.primary, custom_id=f"poll_{i}")
-        btn.callback = await make_callback(i)
-        view.add_item(btn)
+    embed.add_field(name="Unlocked by", value=actor_tag, inline=False)
+    embed.add_field(name="Roles restored (approx)", value=str(restored), inline=True)
+    embed.timestamp = datetime.now(timezone.utc)
+    await send_log(bot, embed=embed)
 
-    # send
-    channel = interaction.channel
-    sent = await channel.send(embed=embed, view=view)
-    # store poll
-    poll_id = f"{interaction.id}"
-    active_polls[poll_id] = {
-        "question": question,
-        "title": title,
-        "footer": footer,
-        "options": opts,
-        "votes": [0] * len(opts),
-        "voters": {},
-        "message": sent,
-        "ended": False,
-        "expires_at": datetime.utcnow() + timedelta(hours=max(1, duration))
-    }
+@tree.command(name="unlockserver", description="Unlock channels and restore roles after serveroverride")
+async def unlockserver(inter: discord.Interaction):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
 
-    # schedule auto-close
-    async def auto_close(pid):
-        await asyncio.sleep(duration * 3600)
-        p = active_polls.get(pid)
-        if not p:
+    if not isinstance(inter.user, discord.Member) or (inter.guild and inter.guild.get_role(ADMIN_OVERRIDE_ROLE_ID) not in inter.user.roles):
+        await send_log(bot, content=f"/unlockserver denied for {inter.user}")
+        return await inter.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=False, thinking=True)
+    try:
+        await unlock_server(inter.guild, f"{inter.user} ({inter.user.id})")
+    except Exception as e:
+        print(f"[UNLOCK] error: {e}")
+        return await inter.followup.send("❌ Error while unlocking server.")
+    await inter.followup.send("✅ Server unlocked and previous permissions restored.")
+
+@tree.command(name="serverunlock", description="Alias of /unlockserver")
+async def serverunlock(inter: discord.Interaction):
+    await unlockserver.callback(inter)  # reuse above
+
+# ============================
+# POLLS
+# ============================
+
+@tree.command(name="poll", description="Create a multiple-choice poll (2–10 options)")
+@app_commands.describe(
+    question="The poll question",
+    duration="Duration in hours (integer)",
+    option1="Option 1",
+    option2="Option 2",
+    option3="Option 3 (optional)",
+    option4="Option 4 (optional)",
+    option5="Option 5 (optional)",
+    option6="Option 6 (optional)",
+    option7="Option 7 (optional)",
+    option8="Option 8 (optional)",
+    option9="Option 9 (optional)",
+    option10="Option 10 (optional)",
+    title="Optional custom title",
+    footer="Optional footer",
+    voter_role="Optional role required to vote",
+)
+async def poll(
+    inter: discord.Interaction,
+    question: str,
+    duration: int,
+    option1: str,
+    option2: str,
+    option3: Optional[str] = None,
+    option4: Optional[str] = None,
+    option5: Optional[str] = None,
+    option6: Optional[str] = None,
+    option7: Optional[str] = None,
+    option8: Optional[str] = None,
+    option9: Optional[str] = None,
+    option10: Optional[str] = None,
+    title: Optional[str] = None,
+    footer: Optional[str] = None,
+    voter_role: Optional[discord.Role] = None,
+):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+
+    # SLT or Staff Shouts only
+    member: discord.Member = inter.user  # type: ignore
+    if not ({r.id for r in member.roles} & {SLT_ROLE_ID, STAFF_SHOUT_ROLE_ID}):
+        await send_log(bot, content=f"/poll denied for {inter.user}")
+        return await inter.response.send_message("❌ You do not have permission to create polls.", ephemeral=True)
+
+    options = [o for o in [option1, option2, option3, option4, option5, option6, option7, option8, option9, option10] if o]
+    if len(options) < 2:
+        return await inter.response.send_message("❌ You must provide at least 2 options.", ephemeral=True)
+    if len(options) > 10:
+        return await inter.response.send_message("❌ Maximum 10 options allowed.", ephemeral=True)
+
+    await inter.response.defer(ephemeral=True, thinking=True)
+    # Build poll data
+    p = PollData(
+        question=question,
+        options=options,
+        issuer_id=inter.user.id,
+        channel_id=inter.channel_id,
+        message_id=0,
+        votes=[0] * len(options),
+        voters={},
+        ended=False,
+        end_ts=now_ts() + max(1, duration) * 3600,
+        title=title,
+        footer=footer,
+        voter_role_id=(voter_role.id if voter_role else None),
+    )
+
+    # Send initial embed + buttons
+    e = build_poll_embed(p, live=True)
+    poll_id_placeholder = "pending"
+    v = PollView(poll_id_placeholder, options)
+    msg = await inter.channel.send(embed=e, view=v)
+    poll_id = str(msg.id)
+
+    # Fix custom_ids to include actual poll_id (since we didn't know it before send)
+    # Rebuild with correct IDs and edit
+    v = PollView(poll_id, options)
+    await msg.edit(view=v)
+
+    # Save
+    p.message_id = msg.id
+    active_polls[poll_id] = p
+
+    # auto-close task
+    async def closer():
+        await asyncio.sleep(max(1, duration) * 3600)
+        # If already ended, skip
+        poll = active_polls.get(poll_id)
+        if not poll or poll.ended:
             return
-        p["ended"] = True
-        finalDesc = "\n\n".join(f"{i+1}. {opt} — {p['votes'][i] or 0} votes" for i, opt in enumerate(p["options"]))
-        finalEmbed = discord.Embed(title=p["title"] or "Poll (Closed)", description=f"**{p['question']}**\n\n{finalDesc}", color=0xADD8E6)
-        finalEmbed.set_thumbnail(url=THUMBNAIL_URL)
-        finalEmbed.set_image(url=POLL_GIF_URL)
-        finalEmbed.set_footer(text=p["footer"] or "Poll ended")
+        poll.ended = True
+        # disable buttons by replacing with disabled view
+        dv = discord.ui.View(timeout=None)
+        for i, opt in enumerate(poll.options):
+            label = opt[:77] + "…" if len(opt) > 80 else opt
+            b = discord.ui.Button(label=f"{i+1}. {label}", style=discord.ButtonStyle.primary, disabled=True)
+            dv.add_item(b)
         try:
-            await p["message"].edit(embed=finalEmbed, view=None)
-        except Exception:
-            pass
-        active_polls.pop(pid, None)
-    bot.loop.create_task(auto_close(poll_id))
+            ch = bot.get_channel(poll.channel_id) or await bot.fetch_channel(poll.channel_id)
+            if isinstance(ch, discord.TextChannel):
+                m = await ch.fetch_message(poll.message_id)
+                await m.edit(embed=build_poll_embed(poll, live=False), view=dv)
+        except Exception as e:
+            print(f"[POLL] auto-close edit failed: {e}")
+        active_polls.pop(poll_id, None)
 
-    await interaction.followup.send(f"Poll created — Poll ID: {poll_id}", ephemeral=True)
-    await log_command(interaction.user, "poll", interaction.channel_id, f"question:{question}")
+    p.timeout_task = asyncio.create_task(closer())
 
-# ---------- SESSION COMMANDS (slash only, ALT role required, posts only to SESSION_CHANNEL_ID) ----------
-@bot.tree.command(name="sessionvote", description="Session Vote (ALT only)")
-async def sc_sessionvote(interaction: discord.Interaction):
-    await handle_session_cmd(interaction, "vote")
+    await inter.followup.send(f"✅ Poll created — length: **{duration}h**. Poll ID: `{poll_id}`", ephemeral=True)
+    await send_log(bot, content=f"/poll by {inter.user} — q: {question}")
 
-@bot.tree.command(name="ssu", description="Session Start Up (ALT only)")
-async def sc_ssu(interaction: discord.Interaction):
-    await handle_session_cmd(interaction, "start")
+@tree.command(name="closepoll", description="Manually close a poll")
+@app_commands.describe(
+    pollid="The poll ID (message ID) to close",
+    title="Optional new title for closed poll",
+    footer="Optional footer for closed poll",
+    voterrole="Optional voter role to set/override",
+)
+async def closepoll(inter: discord.Interaction, pollid: str, title: Optional[str] = None, footer: Optional[str] = None, voterrole: Optional[discord.Role] = None):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
 
-@bot.tree.command(name="ssd", description="Session Shut-Down (ALT only)")
-async def sc_ssd(interaction: discord.Interaction):
-    await handle_session_cmd(interaction, "shutdown")
+    p = active_polls.get(pollid)
+    if not p:
+        return await inter.response.send_message(f"❌ Poll `{pollid}` not found or already closed.", ephemeral=True)
 
-@bot.tree.command(name="sessionlow", description="Session Low (ALT only)")
-async def sc_sessionlow(interaction: discord.Interaction):
-    await handle_session_cmd(interaction, "low")
+    # only issuer, SLT, Staff Shouts, or Admin Override
+    member: discord.Member = inter.user  # type: ignore
+    can_close = (
+        inter.user.id == p.issuer_id or
+        {r.id for r in member.roles}.intersection({SLT_ROLE_ID, STAFF_SHOUT_ROLE_ID, ADMIN_OVERRIDE_ROLE_ID})
+    )
+    if not can_close:
+        await send_log(bot, content=f"/closepoll denied for {inter.user}")
+        return await inter.response.send_message("❌ You are not allowed to close this poll.", ephemeral=True)
 
-@bot.tree.command(name="sessionfull", description="Session Full (ALT only)")
-async def sc_sessionfull(interaction: discord.Interaction):
-    await handle_session_cmd(interaction, "full")
+    # mark ended & cancel timeout
+    p.ended = True
+    if p.timeout_task and not p.timeout_task.done():
+        p.timeout_task.cancel()
 
-async def handle_session_cmd(interaction: discord.Interaction, kind: str):
-    if is_paused and interaction.user.id != MASTER_USER_ID:
-        return await interaction.response.send_message("Bot is paused.", ephemeral=True)
-    # Only ALT role allowed (use ALT_ROLE_LOCK as requested)
-    member = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if not member:
-        return await interaction.response.send_message("Session commands can only be used in guilds.", ephemeral=True)
-    if ALT_ROLE_LOCK not in [r.id for r in member.roles]:
-        await log_command(interaction.user, f"session {kind} (denied)", interaction.channel_id, "missing ALT role")
-        return await interaction.response.send_message("You do not have permission to use this command. (ALT only)", ephemeral=True)
+    if voterrole:
+        p.voter_role_id = voterrole.id
+    if title:
+        p.title = title
+    if footer:
+        p.footer = footer
 
-    embeds = make_session_embeds(member.display_avatar.url, member.display_name)
-    target_channel = bot.get_channel(SESSION_CHANNEL_ID) or await bot.fetch_channel(SESSION_CHANNEL_ID)
-    if not target_channel:
-        await interaction.response.send_message("Session channel not found.", ephemeral=True)
+    # disable buttons
+    dv = discord.ui.View(timeout=None)
+    for i, opt in enumerate(p.options):
+        label = opt[:77] + "…" if len(opt) > 80 else opt
+        dv.add_item(discord.ui.Button(label=f"{i+1}. {label}", style=discord.ButtonStyle.primary, disabled=True))
+
+    try:
+        ch = bot.get_channel(p.channel_id) or await bot.fetch_channel(p.channel_id)
+        if isinstance(ch, discord.TextChannel):
+            m = await ch.fetch_message(p.message_id)
+            await m.edit(embed=build_poll_embed(p, live=False), view=dv)
+    except Exception as e:
+        print(f"[POLL] manual close edit failed: {e}")
+
+    active_polls.pop(pollid, None)
+    await inter.response.send_message(f"✅ Poll `{pollid}` closed.", ephemeral=True)
+    await send_log(bot, content=f"/closepoll by {inter.user} — poll {pollid}")
+
+# ============================
+# SESSION COMMANDS (ALT ONLY, FIXED CHANNEL)
+# ============================
+
+@tree.command(name="sessionvote", description="Session Vote (ALT only)")
+@require_alt_in_channel()
+async def sessionvote(inter: discord.Interaction):
+    host = inter.user  # type: ignore
+    e = make_session_embed("SESSION VOTE", "Session Vote!\nVote for a session and let's get this underway!\n**5 Votes required!**", SESSION_IMAGES["vote"], host)
+    await inter.channel.send(embed=e)
+    await inter.response.send_message("✅ Posted Session Vote.", ephemeral=True)
+    await send_log(bot, content=f"/sessionvote by {inter.user} in <#{inter.channel_id}>")
+
+@tree.command(name="ssu", description="Session Start Up (ALT only)")
+@require_alt_in_channel()
+async def ssu(inter: discord.Interaction):
+    host = inter.user  # type: ignore
+    e = make_session_embed("SESSION START UP!", "A session has been started!\nPlease join and show support!\nIf you voted and fail to join, you may be moderated.\nServer Code: `ukclr`", SESSION_IMAGES["start"], host)
+    await inter.channel.send(embed=e)
+    await inter.response.send_message("✅ Posted Session Start.", ephemeral=True)
+    await send_log(bot, content=f"/ssu by {inter.user} in <#{inter.channel_id}>")
+
+@tree.command(name="ssd", description="Session Shut-Down (ALT only)")
+@require_alt_in_channel()
+async def ssd(inter: discord.Interaction):
+    host = inter.user  # type: ignore
+    e = make_session_embed("SESSION SHUT-DOWN", "The session has shut!\nPlease leave with effect, or you will be moderated!\nThanks for joining Central London Roleplay.", SESSION_IMAGES["shutdown"], host)
+    await inter.channel.send(embed=e)
+    await inter.response.send_message("✅ Posted Session Shut-Down.", ephemeral=True)
+    await send_log(bot, content=f"/ssd by {inter.user} in <#{inter.channel_id}>")
+
+@tree.command(name="sessionlow", description="Session Low (ALT only)")
+@require_alt_in_channel()
+async def sessionlow(inter: discord.Interaction):
+    host = inter.user  # type: ignore
+    e = make_session_embed("SESSION LOW", "Join up for some peak roleplays!\nIn-Game Code: `ukclr`", SESSION_IMAGES["low"], host)
+    await inter.channel.send(embed=e)
+    await inter.response.send_message("✅ Posted Session Low.", ephemeral=True)
+    await send_log(bot, content=f"/sessionlow by {inter.user} in <#{inter.channel_id}>")
+
+@tree.command(name="sessionfull", description="Session Full (ALT only)")
+@require_alt_in_channel()
+async def sessionfull(inter: discord.Interaction):
+    host = inter.user  # type: ignore
+    e = make_session_embed("SESSION FULL", "Thank you so much for the support, CLR!\nIf you cannot join, there should be a short queue!", SESSION_IMAGES["full"], host)
+    await inter.channel.send(embed=e)
+    await inter.response.send_message("✅ Posted Session Full.", ephemeral=True)
+    await send_log(bot, content=f"/sessionfull by {inter.user} in <#{inter.channel_id}>")
+
+# ============================
+# TICKET PANEL (SLASH)
+# ============================
+
+@tree.command(name="ticketpanel", description="Create a ticket panel with Open/Close buttons")
+async def ticketpanel(inter: discord.Interaction):
+    if is_paused and inter.user.id != MASTER_USER_ID:
+        return await inter.response.send_message("⏸️ Bot is paused.", ephemeral=True)
+    if not inter.user.guild_permissions.administrator:
+        return await inter.response.send_message("❌ Admin only.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🎫 Support Tickets",
+        description="Click the button below to open a private ticket with staff.",
+        color=discord.Color.gold(),
+    )
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    await inter.channel.send(embed=embed, view=TicketPanelView())
+    await inter.response.send_message("✅ Ticket panel created.", ephemeral=True)
+
+# ============================
+# HTTP SERVER (for Railway keep-alive) + UPTIME PINGER
+# ============================
+
+async def handle_root(request: web.Request):
+    return web.Response(text="Bot is running ✔️")
+
+async def run_http_server():
+    try:
+        app = web.Application()
+        app.add_routes([web.get("/", handle_root)])
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        print(f"🌐 HTTP server listening on :{PORT}")
+    except Exception as e:
+        print(f"[HTTP] server error: {e}")
+
+@tasks.loop(minutes=5)
+async def uptime_pinger():
+    if not PING_URL:
         return
     try:
-        await target_channel.send(embed=embeds[kind])
-        await interaction.response.send_message(f"Session {kind} posted to <#{SESSION_CHANNEL_ID}>.", ephemeral=True)
-        await log_command(interaction.user, f"session_{kind}", interaction.channel_id, f"posted to {SESSION_CHANNEL_ID}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(PING_URL, timeout=10) as resp:
+                await resp.text()
     except Exception as e:
-        await interaction.response.send_message("Failed to post session embed.", ephemeral=True)
-        await log_command(interaction.user, f"session_{kind} (error)", interaction.channel_id, str(e))
-        log.exception("session cmd error: %s", e)
+        print(f"[PING] {e}")
 
-# ---------- UPTIME PINGER (ping rails/hosting every 5 minutes) ----------
-@tasks.loop(minutes=5.0)
-async def uptime_ping():
-    # default to http://localhost:3000/ if not set (common)
-    url = os.environ.get("UPTIME_URL", "http://localhost:3000/")
+# ============================
+# ERROR HANDLING
+# ============================
+
+@tree.error
+async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=10) as resp:
-                log.info(f"Uptime ping status: {resp.status}")
-    except Exception as e:
-        log.warning("Uptime ping failed: %s", e)
+        if inter.response.is_done():
+            await inter.followup.send("❌ An error occurred while executing this command.", ephemeral=True)
+        else:
+            await inter.response.send_message("❌ An error occurred while executing this command.", ephemeral=True)
+    except Exception:
+        pass
+    await send_log(bot, content=f"[SlashError] {type(error).__name__}: {error}")
 
-# ---------- Run ----------
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    try:
+        await ctx.reply("❌ An error occurred while executing this command.")
+    except Exception:
+        pass
+    await send_log(bot, content=f"[PrefixError] {type(error).__name__}: {error}")
+
+# ============================
+# MAIN
+# ============================
+
+def main():
+    token = TOKEN
+    if not token:
+        print("ERROR: DISCORD_TOKEN env var not set.")
+        sys.exit(1)
+    bot.run(token)
+
 if __name__ == "__main__":
-    try:
-        bot.run(TOKEN)
-    except Exception as e:
-        log.exception("Fatal error running bot: %s", e)
-        raise
+    main()
